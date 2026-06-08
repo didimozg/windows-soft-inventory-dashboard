@@ -1,0 +1,325 @@
+#requires -Version 2.0
+
+[CmdletBinding()]
+param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ListenPrefix = 'http://+:8080/',
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$DataPath,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$InstallPath,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ContentPath,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ServerExecutablePath,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$Token,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$WebUsername,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$WebPassword,
+
+    [Parameter()]
+    [switch]$OpenFirewall,
+
+    [Parameter()]
+    [switch]$NoRun
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+function Invoke-ServiceControl {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FailureMessage,
+
+        [Parameter()]
+        [int[]]$AllowedExitCodes = @(0)
+    )
+
+    $output = & sc.exe @Arguments 2>&1
+    if ($AllowedExitCodes -notcontains $LASTEXITCODE) {
+        throw ($FailureMessage + " sc.exe exit code: $LASTEXITCODE. Output: " + (($output | Out-String).Trim()))
+    }
+
+    return $output
+}
+
+function Wait-FileRelease {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+
+        [Parameter()]
+        [int]$TimeoutSeconds = 20
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        try {
+            $stream = [System.IO.File]::Open($Path, 'Open', 'ReadWrite', 'None')
+            $stream.Close()
+            return
+        }
+        catch {
+            Start-Sleep -Milliseconds 500
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    throw "File is still locked: $Path"
+}
+
+function ConvertTo-JsonString {
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) {
+        return 'null'
+    }
+
+    $text = [string]$Value
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+
+    foreach ($char in $text.ToCharArray()) {
+        switch ($char) {
+            '"' { [void]$builder.Append('\"') }
+            '\' { [void]$builder.Append('\\') }
+            ([char]8) { [void]$builder.Append('\b') }
+            ([char]9) { [void]$builder.Append('\t') }
+            ([char]10) { [void]$builder.Append('\n') }
+            ([char]12) { [void]$builder.Append('\f') }
+            ([char]13) { [void]$builder.Append('\r') }
+            default {
+                $code = [int][char]$char
+                if ($code -lt 32) {
+                    [void]$builder.Append(('\u{0:x4}' -f $code))
+                }
+                else {
+                    [void]$builder.Append($char)
+                }
+            }
+        }
+    }
+
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Read-ServerConfig {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @{}
+    }
+
+    try {
+        Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue
+        $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+        $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+        $config = $serializer.DeserializeObject($text)
+        if ($config) {
+            return $config
+        }
+    }
+    catch {
+        Write-Warning "Failed to read server config: $($_.Exception.Message)"
+    }
+
+    return @{}
+}
+
+function Write-ServerConfig {
+    param(
+        [string]$Path,
+        [hashtable]$Config
+    )
+
+    $directory = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -Path $directory -ItemType Directory -Force | Out-Null
+    }
+
+    $items = New-Object System.Collections.ArrayList
+    foreach ($key in ($Config.Keys | Sort-Object)) {
+        $value = $Config[$key]
+        [void]$items.Add((ConvertTo-JsonString -Value $key) + ':' + (ConvertTo-JsonString -Value $value))
+    }
+
+    $json = '{' + (($items.ToArray()) -join ',') + '}'
+    [System.IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Get-ConfigValue {
+    param(
+        [object]$Config,
+        [string]$Name
+    )
+
+    if ($Config -and $Config.ContainsKey($Name)) {
+        return $Config[$Name]
+    }
+
+    return $null
+}
+
+if (-not $ConfigPath) {
+    $ConfigPath = Join-Path -Path $env:ProgramData -ChildPath 'WindowsLicenseInventory\server-config.json'
+}
+
+$existingConfig = Read-ServerConfig -Path $ConfigPath
+
+if (-not $InstallPath) {
+    $savedInstallPath = Get-ConfigValue -Config $existingConfig -Name 'InstallPath'
+    if ($savedInstallPath) {
+        $InstallPath = $savedInstallPath
+    }
+    else {
+        $InstallPath = Join-Path -Path $env:ProgramData -ChildPath 'WindowsLicenseInventory\server-bin'
+    }
+}
+
+if (-not $DataPath) {
+    $savedDataPath = Get-ConfigValue -Config $existingConfig -Name 'DataPath'
+    if ($savedDataPath) {
+        $DataPath = $savedDataPath
+    }
+    else {
+        $DataPath = Join-Path -Path $env:ProgramData -ChildPath 'WindowsLicenseInventory\server-data'
+    }
+}
+
+if (-not $ContentPath) {
+    $savedContentPath = Get-ConfigValue -Config $existingConfig -Name 'ContentPath'
+    if ($savedContentPath) {
+        $ContentPath = $savedContentPath
+    }
+    else {
+        $ContentPath = Join-Path -Path $env:ProgramData -ChildPath 'WindowsLicenseInventory\server-content'
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey('ListenPrefix')) {
+    $savedListenPrefix = Get-ConfigValue -Config $existingConfig -Name 'ListenPrefix'
+    if ($savedListenPrefix) {
+        $ListenPrefix = $savedListenPrefix
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey('Token')) {
+    $savedToken = Get-ConfigValue -Config $existingConfig -Name 'Token'
+    if ($savedToken) {
+        $Token = $savedToken
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey('WebUsername')) {
+    $savedWebUsername = Get-ConfigValue -Config $existingConfig -Name 'WebUsername'
+    if ($savedWebUsername) {
+        $WebUsername = $savedWebUsername
+    }
+}
+
+if (-not $PSBoundParameters.ContainsKey('WebPassword')) {
+    $savedWebPassword = Get-ConfigValue -Config $existingConfig -Name 'WebPassword'
+    if ($savedWebPassword) {
+        $WebPassword = $savedWebPassword
+    }
+}
+
+if (-not $ServerExecutablePath) {
+    $projectRoot = Split-Path -Parent $PSScriptRoot
+    $ServerExecutablePath = Join-Path -Path $projectRoot -ChildPath 'build\WindowsLicenseInventoryServer.exe'
+}
+
+if (-not (Test-Path -LiteralPath $ServerExecutablePath)) {
+    & (Join-Path -Path $PSScriptRoot -ChildPath 'Build-Server.ps1') -OutputPath $ServerExecutablePath
+}
+
+foreach ($path in @($InstallPath, $DataPath, $ContentPath)) {
+    if (-not (Test-Path -LiteralPath $path)) {
+        New-Item -Path $path -ItemType Directory -Force | Out-Null
+    }
+}
+
+$serviceName = 'WindowsLicenseInventoryServer'
+$servicePath = Join-Path -Path $InstallPath -ChildPath 'WindowsLicenseInventoryServer.exe'
+$null = & sc.exe query $serviceName 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Invoke-ServiceControl -Arguments @('stop', $serviceName) -FailureMessage "Failed to stop existing service." -AllowedExitCodes @(0, 1062) | Out-Null
+    Invoke-ServiceControl -Arguments @('delete', $serviceName) -FailureMessage "Failed to delete existing service." | Out-Null
+    Wait-FileRelease -Path $servicePath
+}
+
+Copy-Item -LiteralPath $ServerExecutablePath -Destination $servicePath -Force
+$serverVersion = (& $servicePath --version 2>&1 | Select-Object -First 1)
+$dashboardSource = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'server\dashboard'
+Copy-Item -Path (Join-Path -Path $dashboardSource -ChildPath '*') -Destination $ContentPath -Recurse -Force
+
+$serviceCommand = '"' + $servicePath + '" --prefix "' + $ListenPrefix + '" --data "' + $DataPath + '" --content "' + $ContentPath + '"'
+if ($Token) {
+    $serviceCommand += ' --token "' + $Token + '"'
+}
+if ($WebUsername) {
+    $serviceCommand += ' --web-username "' + $WebUsername + '"'
+}
+if ($WebPassword) {
+    $serviceCommand += ' --web-password "' + $WebPassword + '"'
+}
+
+Invoke-ServiceControl -Arguments @('create', $serviceName, 'binPath=', $serviceCommand, 'start=', 'auto', 'DisplayName=', 'Windows Soft Inventory Server') -FailureMessage "Failed to create service. Run PowerShell as Administrator." | Out-Null
+Invoke-ServiceControl -Arguments @('description', $serviceName, "Receives Windows Soft Inventory reports and serves the dashboard. Version $serverVersion.") -FailureMessage "Failed to set service description." | Out-Null
+
+if ($OpenFirewall) {
+    & netsh.exe advfirewall firewall add rule name="Windows Soft Inventory Server" dir=in action=allow protocol=TCP localport=8080 | Out-Null
+}
+
+if (-not $NoRun) {
+    Invoke-ServiceControl -Arguments @('start', $serviceName) -FailureMessage "Failed to start service." | Out-Null
+}
+
+Write-Host "Server service: $serviceName"
+Write-Host "Server version: $serverVersion"
+Write-Host "Data path: $DataPath"
+Write-Host "Dashboard URL: $ListenPrefix"
+if ($WebUsername) {
+    Write-Host "Web auth user: $WebUsername"
+}
+
+$config = @{
+    ListenPrefix = $ListenPrefix
+    DataPath = $DataPath
+    InstallPath = $InstallPath
+    ContentPath = $ContentPath
+    Token = $Token
+    WebUsername = $WebUsername
+    WebPassword = $WebPassword
+}
+Write-ServerConfig -Path $ConfigPath -Config $config
+Write-Host "Server config: $ConfigPath"
