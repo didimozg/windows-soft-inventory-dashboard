@@ -6,8 +6,6 @@ Windows Soft Inventory is a standalone inventory system for Windows workstations
 
 The project uses a small C# client service and a small C# server service. The client pushes inventory reports to the server over HTTP. The server stores each report as a JSON file and serves a built-in web dashboard. The default deployment does not require IIS, SQL Server, Python, Node.js, NuGet packages, or a separate web application runtime.
 
-The current project is the file-based edition. A separate SQL Server fork can evolve database storage without changing this baseline.
-
 ## Main Features
 
 - Client runs as a Windows Service on Windows 7, 8, 10, and 11.
