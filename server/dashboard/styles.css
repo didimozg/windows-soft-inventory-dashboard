@@ -210,6 +210,203 @@ tr.stale td {
   display: none;
 }
 
+.install-panel {
+  margin-bottom: 18px;
+  padding: 16px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.install-grid {
+  display: grid;
+  grid-template-columns: minmax(320px, 1.4fr) minmax(180px, 0.8fr) minmax(180px, 0.8fr) minmax(140px, 0.6fr);
+  gap: 12px;
+  align-items: end;
+}
+
+.install-grid label {
+  display: grid;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+textarea,
+input[type="text"],
+input[type="password"],
+input[type="number"],
+select {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+}
+
+.install-targets-field {
+  grid-column: 1 / span 2;
+  grid-row: 1 / span 2;
+}
+
+.install-targets-field textarea {
+  min-height: 116px;
+  resize: vertical;
+}
+
+.install-action-field {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+.install-server-field {
+  grid-column: 4;
+  grid-row: 1;
+}
+
+.install-user-field {
+  grid-column: 3;
+  grid-row: 2;
+}
+
+.install-password-field {
+  grid-column: 4;
+  grid-row: 2;
+}
+
+.install-force-field {
+  grid-column: 1;
+  grid-row: 3;
+}
+
+.install-trusted-field {
+  grid-column: 2;
+  grid-row: 3;
+}
+
+.install-retention-field {
+  grid-column: 3;
+  grid-row: 3;
+}
+
+.install-grid .primary-button {
+  grid-column: 4;
+  grid-row: 3;
+  align-self: end;
+}
+
+.check-label {
+  min-height: 40px;
+  grid-template-columns: auto 1fr;
+  align-items: center;
+  color: var(--text);
+}
+
+.primary-button {
+  min-height: 40px;
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 650;
+}
+
+.primary-button:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+.install-status {
+  margin-top: 14px;
+}
+
+.install-results {
+  max-height: min(560px, 58vh);
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.install-results-table {
+  min-width: 1160px;
+}
+
+.install-results-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.install-results-table th:nth-child(1),
+.install-results-table td:nth-child(1) {
+  width: 160px;
+}
+
+.install-results-table th:nth-child(2),
+.install-results-table td:nth-child(2) {
+  width: 130px;
+}
+
+.install-results-table th:nth-child(3),
+.install-results-table td:nth-child(3) {
+  width: 330px;
+}
+
+.install-output {
+  max-width: none;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fbfcfe;
+}
+
+.install-history {
+  margin-top: 18px;
+}
+
+.install-history h2 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+.install-history-results {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.install-history-table {
+  min-width: 900px;
+}
+
+.install-history-table th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+.job-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+pre {
+  max-width: 520px;
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12px;
+}
+
 @media (max-width: 820px) {
   .topbar {
     align-items: stretch;
@@ -228,5 +425,14 @@ tr.stale td {
 
   .summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .install-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .install-grid > * {
+    grid-column: auto;
+    grid-row: auto;
   }
 }

@@ -20,6 +20,14 @@ param(
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
+    [string]$ClientPackagePath,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ClientPackageSourcePath,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
     [string]$ConfigPath,
 
     [Parameter()]
@@ -37,6 +45,10 @@ param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$WebPassword,
+
+    [Parameter()]
+    [ValidateRange(1, 3650)]
+    [int]$InstallLogRetentionDays,
 
     [Parameter()]
     [switch]$OpenFirewall,
@@ -225,6 +237,24 @@ if (-not $ContentPath) {
     }
 }
 
+if (-not $ClientPackagePath) {
+    $savedClientPackagePath = Get-ConfigValue -Config $existingConfig -Name 'ClientPackagePath'
+    if ($savedClientPackagePath) {
+        $ClientPackagePath = $savedClientPackagePath
+    }
+    else {
+        $ClientPackagePath = Join-Path -Path $env:ProgramData -ChildPath 'WindowsLicenseInventory\client-package'
+    }
+}
+
+if (-not $ClientPackageSourcePath) {
+    $projectRoot = Split-Path -Parent $PSScriptRoot
+    $defaultClientPackageSourcePath = Join-Path -Path $projectRoot -ChildPath 'dist\gpo-client'
+    if (Test-Path -LiteralPath $defaultClientPackageSourcePath) {
+        $ClientPackageSourcePath = $defaultClientPackageSourcePath
+    }
+}
+
 if (-not $PSBoundParameters.ContainsKey('ListenPrefix')) {
     $savedListenPrefix = Get-ConfigValue -Config $existingConfig -Name 'ListenPrefix'
     if ($savedListenPrefix) {
@@ -253,6 +283,16 @@ if (-not $PSBoundParameters.ContainsKey('WebPassword')) {
     }
 }
 
+if (-not $PSBoundParameters.ContainsKey('InstallLogRetentionDays')) {
+    $savedInstallLogRetentionDays = Get-ConfigValue -Config $existingConfig -Name 'InstallLogRetentionDays'
+    if ($savedInstallLogRetentionDays) {
+        $InstallLogRetentionDays = [int]$savedInstallLogRetentionDays
+    }
+    else {
+        $InstallLogRetentionDays = 30
+    }
+}
+
 if (-not $ServerExecutablePath) {
     $projectRoot = Split-Path -Parent $PSScriptRoot
     $ServerExecutablePath = Join-Path -Path $projectRoot -ChildPath 'build\WindowsLicenseInventoryServer.exe'
@@ -262,7 +302,7 @@ if (-not (Test-Path -LiteralPath $ServerExecutablePath)) {
     & (Join-Path -Path $PSScriptRoot -ChildPath 'Build-Server.ps1') -OutputPath $ServerExecutablePath
 }
 
-foreach ($path in @($InstallPath, $DataPath, $ContentPath)) {
+foreach ($path in @($InstallPath, $DataPath, $ContentPath, $ClientPackagePath)) {
     if (-not (Test-Path -LiteralPath $path)) {
         New-Item -Path $path -ItemType Directory -Force | Out-Null
     }
@@ -281,8 +321,30 @@ Copy-Item -LiteralPath $ServerExecutablePath -Destination $servicePath -Force
 $serverVersion = (& $servicePath --version 2>&1 | Select-Object -First 1)
 $dashboardSource = Join-Path -Path (Split-Path -Parent $PSScriptRoot) -ChildPath 'server\dashboard'
 Copy-Item -Path (Join-Path -Path $dashboardSource -ChildPath '*') -Destination $ContentPath -Recurse -Force
+$winRmInstallerSource = Join-Path -Path $PSScriptRoot -ChildPath 'Install-ClientWinRM.ps1'
+$winRmInstallerPath = Join-Path -Path $InstallPath -ChildPath 'Install-ClientWinRM.ps1'
+Copy-Item -LiteralPath $winRmInstallerSource -Destination $winRmInstallerPath -Force
+$winRmUninstallerSource = Join-Path -Path $PSScriptRoot -ChildPath 'Uninstall-ClientWinRM.ps1'
+$winRmUninstallerPath = Join-Path -Path $InstallPath -ChildPath 'Uninstall-ClientWinRM.ps1'
+Copy-Item -LiteralPath $winRmUninstallerSource -Destination $winRmUninstallerPath -Force
 
-$serviceCommand = '"' + $servicePath + '" --prefix "' + $ListenPrefix + '" --data "' + $DataPath + '" --content "' + $ContentPath + '"'
+if ($ClientPackageSourcePath -and (Test-Path -LiteralPath $ClientPackageSourcePath)) {
+    Copy-Item -Path (Join-Path -Path $ClientPackageSourcePath -ChildPath '*') -Destination $ClientPackagePath -Recurse -Force
+}
+
+$clientNet35PackagePath = Join-Path -Path $ClientPackagePath -ChildPath 'WindowsLicenseInventoryClient-net35.exe'
+$clientNet40PackagePath = Join-Path -Path $ClientPackagePath -ChildPath 'WindowsLicenseInventoryClient-net40.exe'
+$clientNet35Version = $null
+$clientNet40Version = $null
+if (Test-Path -LiteralPath $clientNet35PackagePath) {
+    $clientNet35Version = (& $clientNet35PackagePath --version 2>&1 | Select-Object -First 1)
+}
+if (Test-Path -LiteralPath $clientNet40PackagePath) {
+    $clientNet40Version = (& $clientNet40PackagePath --version 2>&1 | Select-Object -First 1)
+}
+
+$serviceCommand = '"' + $servicePath + '" --prefix "' + $ListenPrefix + '" --data "' + $DataPath + '" --content "' + $ContentPath + '" --client-package "' + $ClientPackagePath + '" --winrm-installer "' + $winRmInstallerPath + '" --winrm-uninstaller "' + $winRmUninstallerPath + '"'
+$serviceCommand += ' --install-log-retention-days "' + $InstallLogRetentionDays + '"'
 if ($Token) {
     $serviceCommand += ' --token "' + $Token + '"'
 }
@@ -307,6 +369,14 @@ if (-not $NoRun) {
 Write-Host "Server service: $serviceName"
 Write-Host "Server version: $serverVersion"
 Write-Host "Data path: $DataPath"
+Write-Host "Client package path: $ClientPackagePath"
+if ($clientNet35Version) {
+    Write-Host "Client package Net35 version: $clientNet35Version"
+}
+if ($clientNet40Version) {
+    Write-Host "Client package Net40 version: $clientNet40Version"
+}
+Write-Host "Client action log retention days: $InstallLogRetentionDays"
 Write-Host "Dashboard URL: $ListenPrefix"
 if ($WebUsername) {
     Write-Host "Web auth user: $WebUsername"
@@ -317,6 +387,8 @@ $config = @{
     DataPath = $DataPath
     InstallPath = $InstallPath
     ContentPath = $ContentPath
+    ClientPackagePath = $ClientPackagePath
+    InstallLogRetentionDays = $InstallLogRetentionDays
     Token = $Token
     WebUsername = $WebUsername
     WebPassword = $WebPassword

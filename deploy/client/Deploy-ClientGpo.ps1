@@ -30,8 +30,12 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $ServiceName = 'WindowsLicenseInventory'
+$ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $ScriptDirectory) {
+    $ScriptDirectory = (Get-Location).Path
+}
 $LogPath = Join-Path -Path $env:ProgramData -ChildPath 'WindowsLicenseInventory\Logs\gpo-deploy.log'
-# $CentralLogPath = Join-Path -Path (Join-Path -Path $PSScriptRoot -ChildPath 'Logs') -ChildPath ($env:COMPUTERNAME + '.log')
+# $CentralLogPath = Join-Path -Path (Join-Path -Path $ScriptDirectory -ChildPath 'Logs') -ChildPath ($env:COMPUTERNAME + '.log')
 
 function Write-DeployLog {
     param([string]$Message)
@@ -207,10 +211,10 @@ function Get-IsWindows7Family {
 
 function Get-DefaultPackageClientPath {
     if (Get-IsWindows7Family) {
-        return Join-Path -Path $PSScriptRoot -ChildPath 'WindowsLicenseInventoryClient-net35.exe'
+        return Join-Path -Path $ScriptDirectory -ChildPath 'WindowsLicenseInventoryClient-net35.exe'
     }
 
-    return Join-Path -Path $PSScriptRoot -ChildPath 'WindowsLicenseInventoryClient-net40.exe'
+    return Join-Path -Path $ScriptDirectory -ChildPath 'WindowsLicenseInventoryClient-net40.exe'
 }
 
 if (-not $InstallPath) {

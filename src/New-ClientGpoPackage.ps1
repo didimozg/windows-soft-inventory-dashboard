@@ -44,6 +44,7 @@ elseif (-not [System.IO.Path]::IsPathRooted($OutputPath)) {
 
 if (-not $ClientNet35Path) {
     $ClientNet35Path = Join-Path -Path $projectRoot -ChildPath 'build\WindowsLicenseInventoryClient-net35.exe'
+    & (Join-Path -Path $PSScriptRoot -ChildPath 'Build-Client.ps1') -OutputPath $ClientNet35Path -TargetFramework Net35
 }
 elseif (-not [System.IO.Path]::IsPathRooted($ClientNet35Path)) {
     $ClientNet35Path = Join-Path -Path $projectRoot -ChildPath $ClientNet35Path
@@ -51,6 +52,7 @@ elseif (-not [System.IO.Path]::IsPathRooted($ClientNet35Path)) {
 
 if (-not $ClientNet40Path) {
     $ClientNet40Path = Join-Path -Path $projectRoot -ChildPath 'build\WindowsLicenseInventoryClient-net40.exe'
+    & (Join-Path -Path $PSScriptRoot -ChildPath 'Build-Client.ps1') -OutputPath $ClientNet40Path -TargetFramework Net40
 }
 elseif (-not [System.IO.Path]::IsPathRooted($ClientNet40Path)) {
     $ClientNet40Path = Join-Path -Path $projectRoot -ChildPath $ClientNet40Path
@@ -93,6 +95,8 @@ $lines = @(
     ('set PACKAGE_ROOT={0}' -f $escapedPackageSharePath),
     ('set SERVER_URL={0}' -f $escapedServerUrl),
     ('set INTERVAL_HOURS={0}' -f $IntervalHours),
+    'set DEPLOY_SCRIPT=%PACKAGE_ROOT%\Deploy-ClientGpo.ps1',
+    'set WAIT_SECONDS=90',
     '',
     'set ARGS=-ServerUrl "%SERVER_URL%" -IntervalHours %INTERVAL_HOURS%'
 )
@@ -103,7 +107,15 @@ if ($Token) {
 }
 
 $lines += ''
-$lines += 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PACKAGE_ROOT%\Deploy-ClientGpo.ps1" %ARGS%'
+$lines += ':WAIT_PACKAGE'
+$lines += 'if exist "%DEPLOY_SCRIPT%" goto RUN_DEPLOY'
+$lines += 'if "%WAIT_SECONDS%"=="0" exit /b 2'
+$lines += 'ping -n 2 127.0.0.1 >nul'
+$lines += 'set /a WAIT_SECONDS-=1'
+$lines += 'goto WAIT_PACKAGE'
+$lines += ''
+$lines += ':RUN_DEPLOY'
+$lines += 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%DEPLOY_SCRIPT%" %ARGS%'
 $lines += ''
 $lines += 'exit /b %ERRORLEVEL%'
 

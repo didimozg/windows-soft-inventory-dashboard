@@ -15,7 +15,7 @@ namespace WindowsLicenseInventory
     internal sealed class Program
     {
         private const string ServiceName = "WindowsLicenseInventory";
-        internal const string ProductVersion = "1.2.1";
+        internal const string ProductVersion = "1.3.0";
 
         private static int Main(string[] args)
         {
@@ -198,6 +198,7 @@ namespace WindowsLicenseInventory
             result["collectedAt"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
             result["computerName"] = Environment.MachineName;
             result["domain"] = GetString(computer, "Domain");
+            result["ipAddresses"] = GetIpAddresses();
             result["manufacturer"] = GetString(computer, "Manufacturer");
             result["model"] = GetString(computer, "Model");
             result["serialNumber"] = GetString(bios, "SerialNumber");
@@ -207,6 +208,73 @@ namespace WindowsLicenseInventory
             result["software"] = options.SkipSoftware ? new ArrayList() : GetInstalledSoftware();
 
             return result;
+        }
+
+        private ArrayList GetIpAddresses()
+        {
+            ArrayList result = new ArrayList();
+            Dictionary<string, bool> seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            ArrayList adapters = QueryList("SELECT IPAddress, IPEnabled FROM Win32_NetworkAdapterConfiguration WHERE IPEnabled = TRUE");
+
+            foreach (Dictionary<string, object> adapter in adapters)
+            {
+                if (!adapter.ContainsKey("IPAddress") || adapter["IPAddress"] == null)
+                {
+                    continue;
+                }
+
+                IEnumerable addresses = adapter["IPAddress"] as IEnumerable;
+                if (addresses == null || adapter["IPAddress"] is string)
+                {
+                    AddIpAddress(result, seen, Convert.ToString(adapter["IPAddress"]));
+                    continue;
+                }
+
+                foreach (object address in addresses)
+                {
+                    AddIpAddress(result, seen, Convert.ToString(address));
+                }
+            }
+
+            return result;
+        }
+
+        private static void AddIpAddress(ArrayList result, Dictionary<string, bool> seen, string value)
+        {
+            if (String.IsNullOrEmpty(value))
+            {
+                return;
+            }
+
+            IPAddress address;
+            if (!IPAddress.TryParse(value, out address))
+            {
+                return;
+            }
+
+            if (IPAddress.IsLoopback(address))
+            {
+                return;
+            }
+
+            if (address.GetAddressBytes().Length != 4)
+            {
+                return;
+            }
+
+            string normalized = address.ToString();
+            if (normalized.StartsWith("169.254.", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            if (seen.ContainsKey(normalized))
+            {
+                return;
+            }
+
+            seen[normalized] = true;
+            result.Add(normalized);
         }
 
         private Dictionary<string, object> GetOperatingSystem()

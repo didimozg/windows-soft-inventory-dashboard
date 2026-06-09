@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-Describe 'Windows license inventory dashboard project' {
+Describe 'Windows soft inventory dashboard project' {
     BeforeAll {
         $script:ProjectRoot = Split-Path -Parent $PSScriptRoot
     }
@@ -12,9 +12,12 @@ Describe 'Windows license inventory dashboard project' {
             'src\Build-Server.ps1',
             'src\New-ClientGpoPackage.ps1',
             'src\Install-Client.ps1',
+            'src\Install-ClientWinRM.ps1',
             'src\Uninstall-Client.ps1',
+            'src\Uninstall-ClientWinRM.ps1',
             'src\Build-InventoryIndex.ps1',
             'src\Install-Server.ps1',
+            'deploy\client\Deploy-ClientGpo.ps1',
             'examples\install-server.ps1',
             'examples\install-client.ps1',
             'examples\run-client-once.ps1'

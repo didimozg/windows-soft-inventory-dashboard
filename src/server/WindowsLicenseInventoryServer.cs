@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -14,7 +15,7 @@ namespace WindowsLicenseInventory
     internal sealed class Program
     {
         private const string ServiceName = "WindowsLicenseInventoryServer";
-        internal const string ProductVersion = "1.4.1";
+        internal const string ProductVersion = "1.5.8";
 
         private static int Main(string[] args)
         {
@@ -71,9 +72,13 @@ namespace WindowsLicenseInventory
         public IPAddress Address;
         public string DataPath;
         public string ContentPath;
+        public string ClientPackagePath;
+        public string WinRmInstallerPath;
+        public string WinRmUninstallerPath;
         public string Token;
         public string WebUsername;
         public string WebPassword;
+        public int InstallLogRetentionDays;
         public bool ConsoleMode;
         public bool ShowVersion;
 
@@ -84,6 +89,10 @@ namespace WindowsLicenseInventory
             options.Address = IPAddress.Any;
             options.DataPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), @"WindowsLicenseInventory\server");
             options.ContentPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), @"WindowsLicenseInventory\server-content");
+            options.ClientPackagePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), @"WindowsLicenseInventory\client-package");
+            options.WinRmInstallerPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), @"WindowsLicenseInventory\server-bin\Install-ClientWinRM.ps1");
+            options.WinRmUninstallerPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), @"WindowsLicenseInventory\server-bin\Uninstall-ClientWinRM.ps1");
+            options.InstallLogRetentionDays = 30;
 
             for (int i = 0; i < args.Length; i++)
             {
@@ -125,6 +134,18 @@ namespace WindowsLicenseInventory
                 {
                     options.ContentPath = args[++i];
                 }
+                else if (key == "--client-package" && i + 1 < args.Length)
+                {
+                    options.ClientPackagePath = args[++i];
+                }
+                else if (key == "--winrm-installer" && i + 1 < args.Length)
+                {
+                    options.WinRmInstallerPath = args[++i];
+                }
+                else if (key == "--winrm-uninstaller" && i + 1 < args.Length)
+                {
+                    options.WinRmUninstallerPath = args[++i];
+                }
                 else if (key == "--token" && i + 1 < args.Length)
                 {
                     options.Token = args[++i];
@@ -137,6 +158,14 @@ namespace WindowsLicenseInventory
                 {
                     options.WebPassword = args[++i];
                 }
+                else if (key == "--install-log-retention-days" && i + 1 < args.Length)
+                {
+                    int days;
+                    if (Int32.TryParse(args[++i], out days) && days > 0)
+                    {
+                        options.InstallLogRetentionDays = days;
+                    }
+                }
             }
 
             return options;
@@ -146,6 +175,8 @@ namespace WindowsLicenseInventory
     internal sealed class InventoryServer
     {
         private readonly ServerOptions options;
+        private readonly object installJobsLock = new object();
+        private readonly Dictionary<string, InstallJob> installJobs = new Dictionary<string, InstallJob>();
         private TcpListener listener;
         private Thread worker;
         private bool running;
@@ -161,6 +192,11 @@ namespace WindowsLicenseInventory
             {
                 Directory.CreateDirectory(options.DataPath);
             }
+            if (!Directory.Exists(GetInstallJobDirectory()))
+            {
+                Directory.CreateDirectory(GetInstallJobDirectory());
+            }
+            CleanupInstallJobLogs();
 
             listener = new TcpListener(options.Address, options.Port);
             listener.Start();
@@ -222,6 +258,22 @@ namespace WindowsLicenseInventory
                     {
                         DeleteClient(stream, request);
                     }
+                    else if (request.Method == "POST" && request.Path == "/api/v1/client-install")
+                    {
+                        StartClientAction(stream, request, "install");
+                    }
+                    else if (request.Method == "POST" && request.Path == "/api/v1/client-uninstall")
+                    {
+                        StartClientAction(stream, request, "uninstall");
+                    }
+                    else if (request.Method == "GET" && request.Path == "/api/v1/client-install")
+                    {
+                        SendClientInstallJobs(stream);
+                    }
+                    else if (request.Method == "GET" && request.Path.StartsWith("/api/v1/client-install/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        SendClientInstallJob(stream, request);
+                    }
                     else if (request.Method == "GET" && (request.Path == "/" || request.Path == "/index.html"))
                     {
                         SendDashboardFile(stream, "index.html", DashboardHtml, "text/html; charset=utf-8");
@@ -255,7 +307,7 @@ namespace WindowsLicenseInventory
                 return;
             }
 
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            JavaScriptSerializer serializer = CreateJsonSerializer();
             Dictionary<string, object> inventory = serializer.Deserialize<Dictionary<string, object>>(request.Body);
             string computerName = Convert.ToString(inventory.ContainsKey("computerName") ? inventory["computerName"] : "unknown");
             string path = Path.Combine(options.DataPath, SanitizeFileName(computerName) + ".json");
@@ -290,6 +342,543 @@ namespace WindowsLicenseInventory
 
             File.Delete(path);
             SendJson(stream, "{\"status\":\"deleted\"}");
+        }
+
+        private void StartClientAction(NetworkStream stream, RequestContext request, string action)
+        {
+            JavaScriptSerializer serializer = CreateJsonSerializer();
+            Dictionary<string, object> payload = serializer.Deserialize<Dictionary<string, object>>(request.Body);
+            string targetText = Convert.ToString(payload.ContainsKey("targets") ? payload["targets"] : "");
+            string serverUrl = Convert.ToString(payload.ContainsKey("serverUrl") ? payload["serverUrl"] : "");
+            string username = Convert.ToString(payload.ContainsKey("username") ? payload["username"] : "");
+            string password = Convert.ToString(payload.ContainsKey("password") ? payload["password"] : "");
+            bool force = payload.ContainsKey("force") && Convert.ToBoolean(payload["force"]);
+            bool addToTrustedHosts = payload.ContainsKey("addToTrustedHosts") && Convert.ToBoolean(payload["addToTrustedHosts"]);
+            int retentionDays = options.InstallLogRetentionDays;
+            if (payload.ContainsKey("retentionDays"))
+            {
+                Int32.TryParse(Convert.ToString(payload["retentionDays"]), out retentionDays);
+            }
+            retentionDays = NormalizeRetentionDays(retentionDays);
+            ArrayList targets = ExpandInstallTargets(targetText);
+
+            if (targets.Count == 0)
+            {
+                SendText(stream, "{\"error\":\"at least one target is required\"}", "application/json; charset=utf-8", 400);
+                return;
+            }
+
+            if (action == "install" && String.IsNullOrEmpty(serverUrl))
+            {
+                SendText(stream, "{\"error\":\"serverUrl is required\"}", "application/json; charset=utf-8", 400);
+                return;
+            }
+
+            if (!addToTrustedHosts && !String.IsNullOrEmpty(username) && !String.IsNullOrEmpty(password) && ContainsIpAddressTarget(targets))
+            {
+                addToTrustedHosts = true;
+            }
+
+            InstallJob job = new InstallJob();
+            job.Id = Guid.NewGuid().ToString("N");
+            job.Action = action;
+            job.Status = "queued";
+            job.CreatedAtUtc = DateTime.UtcNow;
+            job.Targets = targets;
+            job.Results = new ArrayList();
+            job.ServerUrl = serverUrl;
+            job.Username = username;
+            job.Password = password;
+            job.Force = force;
+            job.AddToTrustedHosts = addToTrustedHosts;
+            job.RetentionDays = retentionDays;
+
+            lock (installJobsLock)
+            {
+                installJobs[job.Id] = job;
+                SaveInstallJob(job);
+            }
+
+            ThreadPool.QueueUserWorkItem(RunClientActionJob, job);
+            SendJson(stream, "{\"jobId\":\"" + job.Id + "\",\"status\":\"queued\"}");
+        }
+
+        private void SendClientInstallJobs(NetworkStream stream)
+        {
+            CleanupInstallJobLogs();
+            ArrayList jobs = new ArrayList();
+            JavaScriptSerializer serializer = CreateJsonSerializer();
+
+            foreach (string file in Directory.GetFiles(GetInstallJobDirectory(), "*.json"))
+            {
+                try
+                {
+                    Dictionary<string, object> job = serializer.Deserialize<Dictionary<string, object>>(File.ReadAllText(file, Encoding.UTF8));
+                    Dictionary<string, object> summary = new Dictionary<string, object>();
+                    summary["id"] = GetStringValue(job, "id");
+                    summary["action"] = GetStringValue(job, "action");
+                    summary["status"] = GetStringValue(job, "status");
+                    summary["createdAt"] = GetStringValue(job, "createdAt");
+                    summary["startedAt"] = GetStringValue(job, "startedAt");
+                    summary["completedAt"] = GetStringValue(job, "completedAt");
+                    summary["serverUrl"] = GetStringValue(job, "serverUrl");
+                    summary["username"] = GetStringValue(job, "username");
+                    summary["retentionDays"] = GetIntValue(job, "retentionDays", options.InstallLogRetentionDays);
+
+                    ArrayList targets = job.ContainsKey("targets") ? job["targets"] as ArrayList : null;
+                    ArrayList results = job.ContainsKey("results") ? job["results"] as ArrayList : null;
+                    summary["targetCount"] = targets == null ? 0 : targets.Count;
+                    summary["resultCount"] = results == null ? 0 : results.Count;
+                    summary["failedCount"] = CountInstallResults(results, "failed");
+                    jobs.Add(summary);
+                }
+                catch
+                {
+                }
+            }
+
+            ArrayList sorted = SortJobsByCreatedAtDescending(jobs);
+            Dictionary<string, object> response = new Dictionary<string, object>();
+            response["defaultRetentionDays"] = options.InstallLogRetentionDays;
+            response["jobs"] = sorted;
+            SendJson(stream, serializer.Serialize(response));
+        }
+
+        private void SendClientInstallJob(NetworkStream stream, RequestContext request)
+        {
+            const string prefix = "/api/v1/client-install/";
+            string id = request.Path.Substring(prefix.Length);
+            int queryStart = id.IndexOf('?');
+            if (queryStart >= 0)
+            {
+                id = id.Substring(0, queryStart);
+            }
+
+            InstallJob job = null;
+            lock (installJobsLock)
+            {
+                if (installJobs.ContainsKey(id))
+                {
+                    job = installJobs[id];
+                }
+            }
+
+            if (job == null)
+            {
+                string persisted = ReadInstallJobJson(id);
+                if (persisted == null)
+                {
+                    SendText(stream, "{\"error\":\"job not found\"}", "application/json; charset=utf-8", 404);
+                    return;
+                }
+
+                SendJson(stream, persisted);
+                return;
+            }
+
+            JavaScriptSerializer serializer = CreateJsonSerializer();
+            SendJson(stream, serializer.Serialize(job.ToDictionary()));
+        }
+
+        private void RunClientActionJob(object state)
+        {
+            InstallJob job = (InstallJob)state;
+            job.Status = "running";
+            job.StartedAtUtc = DateTime.UtcNow;
+            lock (installJobsLock)
+            {
+                SaveInstallJob(job);
+            }
+
+            foreach (string target in job.Targets)
+            {
+                Dictionary<string, object> result = job.Action == "uninstall"
+                    ? RunClientUninstallTarget(target, job.Username, job.Password, job.AddToTrustedHosts)
+                    : RunClientInstallTarget(target, job.ServerUrl, job.Username, job.Password, job.Force, job.AddToTrustedHosts);
+                lock (installJobsLock)
+                {
+                    job.Results.Add(result);
+                    SaveInstallJob(job);
+                }
+            }
+
+            job.CompletedAtUtc = DateTime.UtcNow;
+            job.Status = "completed";
+            lock (installJobsLock)
+            {
+                SaveInstallJob(job);
+            }
+            CleanupInstallJobLogs();
+        }
+
+        private Dictionary<string, object> RunClientInstallTarget(string target, string serverUrl, string username, string password, bool force, bool addToTrustedHosts)
+        {
+            Dictionary<string, object> result = new Dictionary<string, object>();
+            result["target"] = target;
+            result["startedAt"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+            if (!File.Exists(options.WinRmInstallerPath))
+            {
+                result["status"] = "failed";
+                result["message"] = "WinRM installer script was not found: " + options.WinRmInstallerPath;
+                return result;
+            }
+
+            if (!Directory.Exists(options.ClientPackagePath))
+            {
+                result["status"] = "failed";
+                result["message"] = "Client package path was not found: " + options.ClientPackagePath;
+                return result;
+            }
+
+            ProcessStartInfo startInfo = new ProcessStartInfo();
+            startInfo.FileName = "powershell.exe";
+            startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command " + QuoteArgument("[Console]::OutputEncoding = [System.Text.Encoding]::Default; $OutputEncoding = [Console]::OutputEncoding; & " + QuotePowerShellLiteral(options.WinRmInstallerPath) + " " + BuildPowerShellInstallArguments(target, serverUrl, username, password, force, addToTrustedHosts, options.ClientPackagePath));
+            startInfo.UseShellExecute = false;
+            startInfo.RedirectStandardOutput = true;
+            startInfo.RedirectStandardError = true;
+            startInfo.CreateNoWindow = true;
+
+            try
+            {
+                using (Process process = Process.Start(startInfo))
+                {
+                    string output = process.StandardOutput.ReadToEnd();
+                    string error = process.StandardError.ReadToEnd();
+                    process.WaitForExit();
+                    result["exitCode"] = process.ExitCode;
+                    result["output"] = output;
+                    result["error"] = error;
+                    result["status"] = process.ExitCode == 0 ? "completed" : "failed";
+                    result["message"] = process.ExitCode == 0 ? "Client install command completed." : "Client install command failed.";
+                }
+            }
+            catch (Exception ex)
+            {
+                result["status"] = "failed";
+                result["message"] = ex.Message;
+            }
+
+            result["completedAt"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            return result;
+        }
+
+        private Dictionary<string, object> RunClientUninstallTarget(string target, string username, string password, bool addToTrustedHosts)
+        {
+            Dictionary<string, object> result = new Dictionary<string, object>();
+            result["target"] = target;
+            result["startedAt"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+            if (!File.Exists(options.WinRmUninstallerPath))
+            {
+                result["status"] = "failed";
+                result["message"] = "WinRM uninstaller script was not found: " + options.WinRmUninstallerPath;
+                return result;
+            }
+
+            ProcessStartInfo startInfo = new ProcessStartInfo();
+            startInfo.FileName = "powershell.exe";
+            startInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command " + QuoteArgument("[Console]::OutputEncoding = [System.Text.Encoding]::Default; $OutputEncoding = [Console]::OutputEncoding; & " + QuotePowerShellLiteral(options.WinRmUninstallerPath) + " " + BuildPowerShellUninstallArguments(target, username, password, addToTrustedHosts));
+            startInfo.UseShellExecute = false;
+            startInfo.RedirectStandardOutput = true;
+            startInfo.RedirectStandardError = true;
+            startInfo.CreateNoWindow = true;
+
+            try
+            {
+                using (Process process = Process.Start(startInfo))
+                {
+                    string output = process.StandardOutput.ReadToEnd();
+                    string error = process.StandardError.ReadToEnd();
+                    process.WaitForExit();
+                    result["exitCode"] = process.ExitCode;
+                    result["output"] = output;
+                    result["error"] = error;
+                    result["status"] = process.ExitCode == 0 ? "completed" : "failed";
+                    result["message"] = process.ExitCode == 0 ? "Client uninstall command completed." : "Client uninstall command failed.";
+                }
+            }
+            catch (Exception ex)
+            {
+                result["status"] = "failed";
+                result["message"] = ex.Message;
+            }
+
+            result["completedAt"] = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ");
+            return result;
+        }
+
+        private string GetInstallJobDirectory()
+        {
+            return Path.Combine(options.DataPath, "_client-install-jobs");
+        }
+
+        private string GetInstallJobPath(string id)
+        {
+            return Path.Combine(GetInstallJobDirectory(), SanitizeFileName(id) + ".json");
+        }
+
+        private void SaveInstallJob(InstallJob job)
+        {
+            if (!Directory.Exists(GetInstallJobDirectory()))
+            {
+                Directory.CreateDirectory(GetInstallJobDirectory());
+            }
+
+            JavaScriptSerializer serializer = CreateJsonSerializer();
+            File.WriteAllText(GetInstallJobPath(job.Id), serializer.Serialize(job.ToDictionary()), new UTF8Encoding(false));
+        }
+
+        private string ReadInstallJobJson(string id)
+        {
+            string safeId = SanitizeFileName(id);
+            if (String.IsNullOrEmpty(safeId) || safeId != id)
+            {
+                return null;
+            }
+
+            string path = GetInstallJobPath(safeId);
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            return File.ReadAllText(path, Encoding.UTF8);
+        }
+
+        private void CleanupInstallJobLogs()
+        {
+            string directory = GetInstallJobDirectory();
+            if (!Directory.Exists(directory))
+            {
+                return;
+            }
+
+            JavaScriptSerializer serializer = CreateJsonSerializer();
+            foreach (string file in Directory.GetFiles(directory, "*.json"))
+            {
+                try
+                {
+                    Dictionary<string, object> job = serializer.Deserialize<Dictionary<string, object>>(File.ReadAllText(file, Encoding.UTF8));
+                    DateTime createdAt = ParseUtcDate(GetStringValue(job, "createdAt"), File.GetCreationTimeUtc(file));
+                    int retentionDays = NormalizeRetentionDays(GetIntValue(job, "retentionDays", options.InstallLogRetentionDays));
+                    if (createdAt.AddDays(retentionDays) < DateTime.UtcNow)
+                    {
+                        File.Delete(file);
+                    }
+                }
+                catch
+                {
+                    if (File.GetLastWriteTimeUtc(file).AddDays(options.InstallLogRetentionDays) < DateTime.UtcNow)
+                    {
+                        File.Delete(file);
+                    }
+                }
+            }
+        }
+
+        private static int NormalizeRetentionDays(int value)
+        {
+            if (value < 1)
+            {
+                return 30;
+            }
+            if (value > 3650)
+            {
+                return 3650;
+            }
+            return value;
+        }
+
+        private static int CountInstallResults(ArrayList results, string status)
+        {
+            if (results == null)
+            {
+                return 0;
+            }
+
+            int count = 0;
+            foreach (object item in results)
+            {
+                Dictionary<string, object> result = item as Dictionary<string, object>;
+                if (result != null && String.Equals(GetStringValue(result, "status"), status, StringComparison.OrdinalIgnoreCase))
+                {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        private static ArrayList SortJobsByCreatedAtDescending(ArrayList jobs)
+        {
+            ArrayList sorted = new ArrayList(jobs);
+            sorted.Sort(new InstallJobSummaryComparer());
+            return sorted;
+        }
+
+        private static DateTime ParseUtcDate(string value, DateTime fallback)
+        {
+            DateTime parsed;
+            if (DateTime.TryParse(value, out parsed))
+            {
+                return parsed.ToUniversalTime();
+            }
+            return fallback;
+        }
+
+        private static string GetStringValue(Dictionary<string, object> source, string key)
+        {
+            if (source == null || !source.ContainsKey(key) || source[key] == null)
+            {
+                return "";
+            }
+            return Convert.ToString(source[key]);
+        }
+
+        private static int GetIntValue(Dictionary<string, object> source, string key, int fallback)
+        {
+            if (source == null || !source.ContainsKey(key) || source[key] == null)
+            {
+                return fallback;
+            }
+
+            int value;
+            if (Int32.TryParse(Convert.ToString(source[key]), out value))
+            {
+                return value;
+            }
+            return fallback;
+        }
+
+        private static ArrayList ExpandInstallTargets(string input)
+        {
+            ArrayList targets = new ArrayList();
+            Dictionary<string, bool> seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            string[] parts = input.Split(new char[] { '\r', '\n', ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+            foreach (string raw in parts)
+            {
+                foreach (string target in ExpandInstallTarget(raw.Trim()))
+                {
+                    if (!seen.ContainsKey(target))
+                    {
+                        seen[target] = true;
+                        targets.Add(target);
+                    }
+                }
+            }
+
+            return targets;
+        }
+
+        private static ArrayList ExpandInstallTarget(string value)
+        {
+            ArrayList result = new ArrayList();
+            int dash = value.IndexOf('-');
+            if (dash > 0)
+            {
+                string left = value.Substring(0, dash);
+                string right = value.Substring(dash + 1);
+                IPAddress leftAddress;
+                IPAddress rightAddress;
+                if (IPAddress.TryParse(left, out leftAddress))
+                {
+                    string[] leftParts = left.Split('.');
+                    int start;
+                    int end;
+                    if (leftParts.Length == 4 && Int32.TryParse(leftParts[3], out start) && Int32.TryParse(right, out end) && end >= start && end <= 254)
+                    {
+                        string prefix = leftParts[0] + "." + leftParts[1] + "." + leftParts[2] + ".";
+                        for (int i = start; i <= end; i++)
+                        {
+                            result.Add(prefix + i);
+                        }
+                        return result;
+                    }
+                }
+
+                if (IPAddress.TryParse(left, out leftAddress) && IPAddress.TryParse(right, out rightAddress))
+                {
+                    byte[] lb = leftAddress.GetAddressBytes();
+                    byte[] rb = rightAddress.GetAddressBytes();
+                    if (lb.Length == 4 && rb.Length == 4 && lb[0] == rb[0] && lb[1] == rb[1] && lb[2] == rb[2] && rb[3] >= lb[3])
+                    {
+                        string prefix = lb[0] + "." + lb[1] + "." + lb[2] + ".";
+                        for (int i = lb[3]; i <= rb[3]; i++)
+                        {
+                            result.Add(prefix + i);
+                        }
+                        return result;
+                    }
+                }
+            }
+
+            if (!String.IsNullOrEmpty(value))
+            {
+                result.Add(value);
+            }
+            return result;
+        }
+
+        private static string QuoteArgument(string value)
+        {
+            return "\"" + value.Replace("\"", "\\\"") + "\"";
+        }
+
+        private static bool ContainsIpAddressTarget(ArrayList targets)
+        {
+            foreach (string target in targets)
+            {
+                IPAddress address;
+                if (IPAddress.TryParse(target, out address))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static string QuotePowerShellLiteral(string value)
+        {
+            return "'" + value.Replace("'", "''") + "'";
+        }
+
+        private static string BuildPowerShellInstallArguments(string target, string serverUrl, string username, string password, bool force, bool addToTrustedHosts, string packagePath)
+        {
+            StringBuilder builder = new StringBuilder();
+            builder.Append("-ComputerName ").Append(QuotePowerShellLiteral(target));
+            builder.Append(" -ServerUrl ").Append(QuotePowerShellLiteral(serverUrl));
+            builder.Append(" -PackagePath ").Append(QuotePowerShellLiteral(packagePath));
+            if (!String.IsNullOrEmpty(username) && !String.IsNullOrEmpty(password))
+            {
+                builder.Append(" -CredentialUsername ").Append(QuotePowerShellLiteral(username));
+                builder.Append(" -CredentialPassword ").Append(QuotePowerShellLiteral(password));
+            }
+            if (force)
+            {
+                builder.Append(" -Force");
+            }
+            if (addToTrustedHosts)
+            {
+                builder.Append(" -AddToTrustedHosts");
+            }
+            return builder.ToString();
+        }
+
+        private static string BuildPowerShellUninstallArguments(string target, string username, string password, bool addToTrustedHosts)
+        {
+            StringBuilder builder = new StringBuilder();
+            builder.Append("-ComputerName ").Append(QuotePowerShellLiteral(target));
+            if (!String.IsNullOrEmpty(username) && !String.IsNullOrEmpty(password))
+            {
+                builder.Append(" -CredentialUsername ").Append(QuotePowerShellLiteral(username));
+                builder.Append(" -CredentialPassword ").Append(QuotePowerShellLiteral(password));
+            }
+            if (addToTrustedHosts)
+            {
+                builder.Append(" -AddToTrustedHosts");
+            }
+            return builder.ToString();
         }
 
         private bool IsWebRequestAuthorized(RequestContext request)
@@ -340,7 +929,7 @@ namespace WindowsLicenseInventory
         private string BuildClientIndex()
         {
             ArrayList clients = new ArrayList();
-            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            JavaScriptSerializer serializer = CreateJsonSerializer();
 
             foreach (string file in Directory.GetFiles(options.DataPath, "*.json"))
             {
@@ -442,6 +1031,13 @@ namespace WindowsLicenseInventory
             SendText(stream, json, "application/json; charset=utf-8", 200);
         }
 
+        private static JavaScriptSerializer CreateJsonSerializer()
+        {
+            JavaScriptSerializer serializer = new JavaScriptSerializer();
+            serializer.MaxJsonLength = Int32.MaxValue;
+            return serializer;
+        }
+
         private static void SendUnauthorized(NetworkStream stream)
         {
             byte[] body = Encoding.UTF8.GetBytes("Unauthorized");
@@ -477,6 +1073,55 @@ namespace WindowsLicenseInventory
             public string Path;
             public Dictionary<string, string> Headers;
             public string Body;
+        }
+
+        private sealed class InstallJob
+        {
+            public string Id;
+            public string Action;
+            public string Status;
+            public DateTime CreatedAtUtc;
+            public DateTime StartedAtUtc;
+            public DateTime CompletedAtUtc;
+            public ArrayList Targets;
+            public ArrayList Results;
+            public string ServerUrl;
+            public string Username;
+            public string Password;
+            public bool Force;
+            public bool AddToTrustedHosts;
+            public int RetentionDays;
+
+            public Dictionary<string, object> ToDictionary()
+            {
+                Dictionary<string, object> result = new Dictionary<string, object>();
+                result["id"] = Id;
+                result["action"] = String.IsNullOrEmpty(Action) ? "install" : Action;
+                result["status"] = Status;
+                result["createdAt"] = CreatedAtUtc.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                result["startedAt"] = StartedAtUtc == DateTime.MinValue ? null : StartedAtUtc.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                result["completedAt"] = CompletedAtUtc == DateTime.MinValue ? null : CompletedAtUtc.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                result["targets"] = Targets;
+                result["results"] = Results;
+                result["serverUrl"] = ServerUrl;
+                result["username"] = Username;
+                result["force"] = Force;
+                result["addToTrustedHosts"] = AddToTrustedHosts;
+                result["retentionDays"] = RetentionDays;
+                return result;
+            }
+        }
+
+        private sealed class InstallJobSummaryComparer : IComparer
+        {
+            public int Compare(object x, object y)
+            {
+                Dictionary<string, object> left = x as Dictionary<string, object>;
+                Dictionary<string, object> right = y as Dictionary<string, object>;
+                DateTime leftDate = ParseUtcDate(GetStringValue(left, "createdAt"), DateTime.MinValue);
+                DateTime rightDate = ParseUtcDate(GetStringValue(right, "createdAt"), DateTime.MinValue);
+                return rightDate.CompareTo(leftDate);
+            }
         }
 
         private const string DashboardHtml = @"<!doctype html><html lang=""en""><head><meta charset=""utf-8""><meta name=""viewport"" content=""width=device-width, initial-scale=1""><title>Windows Soft Inventory</title><link rel=""stylesheet"" href=""/styles.css""></head><body><header class=""topbar""><div><h1>Windows Soft Inventory</h1><p id=""generatedAt"">Waiting for inventory data.</p></div><input id=""searchInput"" type=""search"" placeholder=""Filter computers, OS, Office, software""></header><main><section class=""summary""><div><span id=""clientCount"">0</span><small>Clients</small></div><div><span id=""windowsActivated"">0</span><small>Windows activated</small></div><div><span id=""officeActivated"">0</span><small>Office activated</small></div><div><span id=""staleCount"">0</span><small>Stale &gt;48h</small></div></section><section class=""table-wrap""><table><thead><tr><th>Computer</th><th>OS</th><th>Office</th><th>Windows</th><th>Office activation</th><th>Software</th><th>Collected</th></tr></thead><tbody id=""inventoryBody""></tbody></table></section></main><script src=""/app.js""></script></body></html>";
