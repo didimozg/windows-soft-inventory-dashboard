@@ -40,7 +40,7 @@ The client collects data through WMI and registry reads. It writes a local JSON 
 
 Client:
 
-- Windows 7, 8, 10, or 11
+- Windows 10, or 11
 - .NET Framework 3.5 or newer
 - Built-in Windows PowerShell for installer scripts
 - Network access to the server HTTP port
