@@ -12,7 +12,7 @@ The project uses a small C# client service and a small C# server service. The cl
 
 ## Main Features
 
-- Client runs as a Windows Service on Windows 7, 8, 10, and 11.
+- Client runs as a Windows Service on Windows 10, and 11.
 - Server runs as a Windows Service on Windows Server or desktop Windows.
 - Inventory data includes OS version, build, architecture, hardware vendor, model, serial number, IP addresses, Office version, activation facts, and installed software.
 - The dashboard has a client view, a per-client software drill-down, and a software view that shows where each package is installed.
